@@ -1,88 +1,88 @@
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import re
 
 path = "./cuiaba/cuiabaTotal.CSV"
-# ─────────────────────────────────────────────
-# 1) LEITURA E LIMPEZA
-# ─────────────────────────────────────────────
-df = pd.read_csv(path, sep=';', dtype=str, na_values='-9999')
 
-# normaliza DATA (2020/01/01 → 2020-01-01)
-df['DATA'] = df['DATA'].str.replace('/', '-', regex=False).str.strip()
+# Carregando os dados de precipitação (2002-2024) a partir do CSV
+# Obs: -9999 e campos vazios indicam dados ausentes.
+df = pd.read_csv(path, sep=';', na_values=['-9999', ''], decimal=',')
 
-# normaliza HORA
-df['HORA'] = df['HORA'].str.replace(' UTC', '', regex=False).str.strip()
-mask = ~df['HORA'].str.contains(':')
-df.loc[mask, 'HORA'] = (
-    df.loc[mask, 'HORA']
-      .str.zfill(4)
-      .str.replace(r'(\d{2})(\d{2})', r'\1:\2', regex=True)
-)
+# Convertendo a coluna de precipitação para numérica (float) e tratando valores com vírgula
+df['PRECIPITACAO'] = pd.to_numeric(df['PRECIPITACAO'], errors='coerce')
 
-# corrige precipitação (vírgula→ponto, ".2"→"0.2")
-def fix_prec(x: str):
-    if pd.isna(x):
-        return x
-    x = x.strip()
-    x = re.sub(r'^([,.])', r'0\1', x)
-    x = x.replace(',', '.')
-    return x
+# Removendo possíveis espaços e padrões de hora "UTC" na coluna HORA
+df['HORA'] = df['HORA'].str.strip().str.replace(' UTC', '')
 
-df['PRECIPITACAO'] = pd.to_numeric(df['PRECIPITACAO'].apply(fix_prec), errors='coerce')
+# Padronizando formato da hora para HH:MM (adiciona ':' em horas que estejam no formato "HHMM")
+mask = df['HORA'].str.len() == 4  # identifica entradas como "2300"
+df.loc[mask, 'HORA'] = df.loc[mask, 'HORA'].str[:2] + ':' + df.loc[mask, 'HORA'].str[2:]
 
-# cria coluna datetime
-df['Datetime'] = pd.to_datetime(
-    df['DATA'] + ' ' + df['HORA'],
-    format='%Y-%m-%d %H:%M',
-    errors='coerce'
-)
+# Padronizando formato da data para YYYY-MM-DD (substitui '/' por '-' quando necessário)
+df['DATA'] = df['DATA'].str.replace('/', '-')
 
-# mantém registros válidos
-df = df.dropna(subset=['Datetime', 'PRECIPITACAO'])
-df = df.set_index('Datetime').sort_index()
+# Combinando DATA e HORA em uma coluna datetime para facilitar agregação por dia
+df['DATETIME'] = pd.to_datetime(df['DATA'] + ' ' + df['HORA'], format="%Y-%m-%d %H:%M", errors='coerce')
 
-# ─────────────────────────────────────────────
-# 2) AGREGAÇÃO DIÁRIA (série regular)
-# ─────────────────────────────────────────────
-daily = df['PRECIPITACAO'].resample('D').sum()
-daily = daily.asfreq('D', fill_value=0)          # garante passo fixo
-x = daily.values - daily.values.mean()           # remove média
+# Removendo linhas que não puderam ser convertidas em datetime (se houver)
+df = df.dropna(subset=['DATETIME'])
 
-# ─────────────────────────────────────────────
-# 3) FFT E ESPECTRO DE POTÊNCIA
-# ─────────────────────────────────────────────
-N = len(x)
-dt = 1.0                                         # 1 dia
-freqs = np.fft.rfftfreq(N, d=dt)                 # ciclos por dia
-fft_vals = np.fft.rfft(x)
-power = np.abs(fft_vals) ** 2
+# Definindo o índice do DataFrame como DATETIME e ordenando (caso não esteja em ordem temporal)
+df = df.set_index('DATETIME').sort_index()
 
-# converte frequência → período (dias)
-periods = np.where(freqs > 0, 1 / freqs, np.inf)
+# Agregando a precipitação por dia (soma das 24 horas de cada dia)
+daily_precip = df['PRECIPITACAO'].resample('D').sum()
 
-# identifica picos principais (exclui freq=0)
-top_idx = np.argsort(power[1:])[::-1][:5] + 1
-dominant_periods = periods[top_idx]
-dominant_powers = power[top_idx]
+# Aplicando Transformada Rápida de Fourier (FFT) na série diária de precipitação
+precip_values = daily_precip.values
+N = len(precip_values)                      # número de dias no registro
+fft_vals = np.fft.fft(precip_values)        # FFT complexa
+freqs = np.fft.fftfreq(N, d=1.0)            # frequências associadas (ciclos por dia)
 
-# imprime resultados
-print("Principais períodos detectados (dias) e potência relativa:")
-for p, pw in zip(dominant_periods, dominant_powers):
-    print(f"{p:8.1f} dias  |  potência = {pw:.2e}")
+# Calculando espectro de potência (magnitude ao quadrado da FFT)
+power_spectrum = np.abs(fft_vals) ** 2
 
-# ─────────────────────────────────────────────
-# 4) PLOT DO ESPECTRO
-# ─────────────────────────────────────────────
-plt.figure(figsize=(8,4))
-plt.plot(periods[1:], power[1:])
-plt.xlim(0, 730)                                 # até 2 anos
-plt.xlabel('Período (dias)')
-plt.ylabel('Potência')
-plt.title('Espectro de Potência (FFT)\nPrecipitação Diária - Cuiabá (2002‑2024)')
-plt.grid(True)
+# Considerando apenas frequências positivas (a FFT de sinal real é simétrica;
+# descartamos frequências negativas duplicadas)
+mask_freq = freqs > 0
+freqs_pos = freqs[mask_freq]               # frequências positivas (ciclos/dia)
+power_pos = power_spectrum[mask_freq]      # potências correspondentes
+
+# Convertendo frequências de ciclos/dia para ciclos/ano para facilitar a interpretação
+freqs_per_year = freqs_pos * 365
+
+# Identificando as principais frequências (maiores picos do espectro, excluindo 0 Hz)
+dominant_indices = power_pos.argsort()[-5:][::-1]  # indices dos 5 maiores valores de potência
+dominant_freqs = freqs_pos[dominant_indices]
+dominant_periods = 1 / dominant_freqs  # período em dias correspondente a cada frequência dominante
+
+# Exibindo os períodos dominantes identificados
+print("Períodos dominantes (dias):", dominant_periods.round(1))
+print("Frequências dominantes (ciclos/ano):", (dominant_freqs*365).round(2))
+
+# Plotando o espectro de potência
+plt.figure(figsize=(8, 5))
+plt.plot(freqs_per_year, power_pos, color='blue')
+plt.yscale('log')  # escala logarítmica para visualizar melhor picos menores
+plt.xlim(0, 60)    # foco em até ~60 ciclos/ano (período mínimo ~6 dias, cobre variação semanal)
+
+# Rótulos e título do gráfico
+plt.xlabel('Frequência (ciclos por ano)')
+plt.ylabel('Potência Espectral')
+plt.title('Espectro de Potência da Precipitação Diária - Cuiabá (2002-2024)')
+
+# Linhas verticais indicando algumas frequências de interesse (1 ciclo/ano, 2 ciclos/ano, etc.)
+plt.axvline(1, color='red', linestyle='--', alpha=0.7)    # ~365 dias
+plt.axvline(2, color='orange', linestyle='--', alpha=0.5) # ~180 dias
+plt.axvline(12, color='green', linestyle='--', alpha=0.5) # ~30 dias (aprox. 12 ciclos/ano)
+plt.axvline(52, color='purple', linestyle='--', alpha=0.5) # ~7 dias (aprox. 52 semanas/ano)
+
+# Anotações de texto para destacar os períodos
+plt.text(1.5, power_pos.max(), '≈ 365 dias', color='red', va='center')
+plt.text(2.5, 2e6, '≈ 180 dias', color='orange')
+plt.text(13, 1e6, '≈ 30 dias', color='green')
+plt.text(53, 3e5, '7 dias', color='purple')
+
 plt.tight_layout()
-plt.savefig("espectro_precipitacao_fft.png", dpi=150)
-print("Gráfico salvo como espectro_precipitacao_fft.png")
-
+plt.savefig('espectro_cuiaba.png')
+plt.show()
